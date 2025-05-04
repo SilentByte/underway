@@ -199,6 +199,7 @@ impl<T: Task + Sync> Worker<T> {
         tokio::time::sleep(self.backoff_delay).await;
     }
 
+    /// Sets the backoff delay.
     pub fn set_backoff_delay(&mut self, delay: Duration) {
         self.backoff_delay = delay;
     }

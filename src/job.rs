@@ -1576,6 +1576,7 @@ where
         }
     }
 
+    /// Starts both a worker and scheduler for the job and returns a handle.
     pub fn start_with_backoff(self, backoff_delay: std::time::Duration) -> JobHandle {
         let shutdown_token = CancellationToken::new();
         let mut workers = JoinSet::new();
