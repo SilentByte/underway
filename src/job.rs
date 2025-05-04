@@ -1576,6 +1576,36 @@ where
         }
     }
 
+    pub fn start_with_backoff(self, backoff_delay: std::time::Duration) -> JobHandle {
+        let shutdown_token = CancellationToken::new();
+        let mut workers = JoinSet::new();
+
+        let queue = self.queue.clone();
+        let job = self.clone();
+
+        let mut worker = Worker::new(queue.clone(), job.clone());
+        worker.set_shutdown_token(shutdown_token.clone());
+        worker.set_backoff_delay(backoff_delay);
+
+        let mut scheduler = Scheduler::new(queue, job);
+        scheduler.set_shutdown_token(shutdown_token.clone());
+        scheduler.set_backoff_delay(backoff_delay);
+
+        // Spawn the tasks using `tokio::spawn` to decouple them from polling the
+        // `Future`.
+        let worker_handle = tokio::spawn(async move { worker.run().await.map_err(Error::from) });
+        let scheduler_handle =
+            tokio::spawn(async move { scheduler.run().await.map_err(Error::from) });
+
+        workers.spawn(worker_handle);
+        workers.spawn(scheduler_handle);
+
+        JobHandle {
+            workers,
+            shutdown_token,
+        }
+    }
+
     fn first_job_input(&self, input: &I) -> Result<JobState> {
         let step_input = serde_json::to_value(input)?;
         let step_index = self.current_index.load(Ordering::SeqCst);

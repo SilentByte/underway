@@ -50,9 +50,19 @@ pub struct Scheduler<T: Task> {
 
     // When this token is cancelled the queue has been shutdown.
     shutdown_token: CancellationToken,
+
+    backoff_delay: StdDuration,
 }
 
 impl<T: Task> Scheduler<T> {
+    async fn backoff_sleep(&self) {
+        tokio::time::sleep(self.backoff_delay).await;
+    }
+
+    pub fn set_backoff_delay(&mut self, delay: StdDuration) {
+        self.backoff_delay = delay;
+    }
+
     /// Creates a new scheduler with the given queue and task.
     ///
     /// # Example
@@ -105,6 +115,7 @@ impl<T: Task> Scheduler<T> {
             queue_lock,
             task: Arc::new(task),
             shutdown_token: CancellationToken::new(),
+            backoff_delay: StdDuration::ZERO,
         }
     }
 
@@ -285,6 +296,7 @@ impl<T: Task> Scheduler<T> {
                         },
                         Err(err) => {
                             tracing::error!(%err, "Postgres shutdown notification error");
+                            self.backoff_sleep().await;
                         }
                     }
                 }

@@ -178,6 +178,8 @@ pub struct Worker<T: Task> {
 
     // When this token is cancelled the queue has been shutdown.
     shutdown_token: CancellationToken,
+
+    backoff_delay: Duration,
 }
 
 impl<T: Task> Clone for Worker<T> {
@@ -187,11 +189,20 @@ impl<T: Task> Clone for Worker<T> {
             task: self.task.clone(),
             concurrency_limit: self.concurrency_limit,
             shutdown_token: self.shutdown_token.clone(),
+            backoff_delay: self.backoff_delay,
         }
     }
 }
 
 impl<T: Task + Sync> Worker<T> {
+    async fn backoff_sleep(&self) {
+        tokio::time::sleep(self.backoff_delay).await;
+    }
+
+    pub fn set_backoff_delay(&mut self, delay: Duration) {
+        self.backoff_delay = delay;
+    }
+
     /// Creates a new worker with the given queue and task.
     ///
     /// # Example
@@ -243,6 +254,7 @@ impl<T: Task + Sync> Worker<T> {
             task: Arc::new(task),
             concurrency_limit: num_cpus::get(),
             shutdown_token: CancellationToken::new(),
+            backoff_delay: Duration::ZERO,
         }
     }
 
@@ -526,6 +538,7 @@ impl<T: Task + Sync> Worker<T> {
 
                         Err(err) => {
                             tracing::error!(%err, "Postgres shutdown notification error");
+                            self.backoff_sleep().await;
                         }
                     }
                 }
@@ -542,6 +555,7 @@ impl<T: Task + Sync> Worker<T> {
 
                         Err(err) => {
                             tracing::error!(%err, "Postgres task change notification error");
+                            self.backoff_sleep().await;
                         }
                     };
 
