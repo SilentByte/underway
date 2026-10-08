@@ -1577,6 +1577,10 @@ where
     }
 
     /// Starts both a worker and scheduler for the job and returns a handle.
+    ///
+    /// Unlike [`Job::start`], the worker and scheduler do not exit on errors
+    /// (e.g. when no database connection can be acquired) but are restarted
+    /// after the given backoff delay.
     pub fn start_with_backoff(self, backoff_delay: std::time::Duration) -> JobHandle {
         let shutdown_token = CancellationToken::new();
         let mut workers = JoinSet::new();
@@ -1594,9 +1598,10 @@ where
 
         // Spawn the tasks using `tokio::spawn` to decouple them from polling the
         // `Future`.
-        let worker_handle = tokio::spawn(async move { worker.run().await.map_err(Error::from) });
+        let worker_handle =
+            tokio::spawn(async move { worker.run_with_restart().await.map_err(Error::from) });
         let scheduler_handle =
-            tokio::spawn(async move { scheduler.run().await.map_err(Error::from) });
+            tokio::spawn(async move { scheduler.run_with_restart().await.map_err(Error::from) });
 
         workers.spawn(worker_handle);
         workers.spawn(scheduler_handle);

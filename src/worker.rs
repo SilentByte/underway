@@ -465,6 +465,24 @@ impl<T: Task + Sync> Worker<T> {
         self.run_every(1.minute()).await
     }
 
+    /// Same as `run` but instead of returning an error, e.g. when no database
+    /// connection can be acquired, the worker is restarted after the backoff
+    /// delay (at least one second). Returns once the worker has been shut down.
+    pub async fn run_with_restart(&self) -> Result {
+        loop {
+            match self.run().await {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    tracing::error!(%err, "Worker failed, restarting after backoff delay");
+                    tokio::select! {
+                        _ = self.shutdown_token.cancelled() => return Ok(()),
+                        _ = tokio::time::sleep(self.backoff_delay.max(Duration::from_secs(1))) => {}
+                    }
+                }
+            }
+        }
+    }
+
     /// Same as `run` but allows for the configuration of the delay between
     /// polls.
     ///
@@ -622,10 +640,13 @@ impl<T: Task + Sync> Worker<T> {
         processing_tasks: &mut JoinSet<()>,
     ) -> Result {
         let payload = task_change.payload();
-        let decoded: TaskChange = serde_json::from_str(payload).map_err(|err| {
-            tracing::error!(%err, "Invalid task change payload; ignoring");
-            err
-        })?;
+        let decoded: TaskChange = match serde_json::from_str(payload) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                tracing::error!(%err, "Invalid task change payload; ignoring");
+                return Ok(());
+            }
+        };
 
         if decoded.queue_name == self.queue.name {
             self.trigger_task_processing(concurrency_limit, processing_tasks)
@@ -659,6 +680,7 @@ impl<T: Task + Sync> Worker<T> {
                     match worker.process_next_task().await {
                         Err(err) => {
                             tracing::error!(err = %err, "Error processing next task");
+                            worker.backoff_sleep().await;
                             continue;
                         }
                         Ok(Some(_)) => {

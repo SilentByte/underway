@@ -274,6 +274,37 @@ impl<T: Task> Scheduler<T> {
             return Ok(());
         };
 
+        let result = self.run_locked().await;
+
+        // N.B.: Release the lock explicitly (also on error) so that a restarted
+        // scheduler is able to acquire it again.
+        if let Err(err) = guard.release_now().await {
+            tracing::error!(%err, "Failed to release scheduler lock");
+        }
+
+        result
+    }
+
+    /// Same as `run` but instead of returning an error, e.g. when no database
+    /// connection can be acquired, the scheduler is restarted after the backoff
+    /// delay (at least one second). Returns once the scheduler has been shut
+    /// down or has nothing to schedule.
+    pub async fn run_with_restart(&self) -> Result {
+        loop {
+            match self.run().await {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    tracing::error!(%err, "Scheduler failed, restarting after backoff delay");
+                    tokio::select! {
+                        _ = self.shutdown_token.cancelled() => return Ok(()),
+                        _ = tokio::time::sleep(self.backoff_delay.max(StdDuration::from_secs(1))) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_locked(&self) -> Result {
         let Some((zoned_schedule, input)) = self.queue.task_schedule(&self.queue.pool).await?
         else {
             // No schedule configured, so we'll exit.
@@ -303,17 +334,29 @@ impl<T: Task> Scheduler<T> {
                 }
 
                 _ = self.shutdown_token.cancelled() => {
-                    guard.release_now().await?;
                     break
                 }
 
                 _ = wait_until(&next) => {
-                    self.process_next_schedule(&input).await?
+                    self.process_next_schedule_with_retry(&input).await
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Enqueues the scheduled task, retrying after the backoff delay (at least
+    /// one second) until it succeeds or the scheduler is shut down, so that a
+    /// scheduled run is not lost due to e.g. an exhausted connection pool.
+    async fn process_next_schedule_with_retry(&self, input: &T::Input) {
+        while self.process_next_schedule(input).await.is_err() {
+            tracing::warn!("Retrying scheduled task enqueue after backoff delay");
+            tokio::select! {
+                _ = self.shutdown_token.cancelled() => return,
+                _ = tokio::time::sleep(self.backoff_delay.max(StdDuration::from_secs(1))) => {}
+            }
+        }
     }
 
     #[instrument(skip_all, fields(task.id = tracing::field::Empty), err)]
