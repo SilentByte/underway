@@ -1580,8 +1580,14 @@ where
     ///
     /// Unlike [`Job::start`], the worker and scheduler do not exit on errors
     /// (e.g. when no database connection can be acquired) but are restarted
-    /// after the given backoff delay.
-    pub fn start_with_backoff(self, backoff_delay: std::time::Duration) -> JobHandle {
+    /// after the given backoff delay. The worker processes at most
+    /// `concurrency_limit` tasks at the same time, each holding a database
+    /// connection.
+    pub fn start_with_backoff(
+        self,
+        backoff_delay: std::time::Duration,
+        concurrency_limit: usize,
+    ) -> JobHandle {
         let shutdown_token = CancellationToken::new();
         let mut workers = JoinSet::new();
 
@@ -1591,6 +1597,7 @@ where
         let mut worker = Worker::new(queue.clone(), job.clone());
         worker.set_shutdown_token(shutdown_token.clone());
         worker.set_backoff_delay(backoff_delay);
+        worker.set_concurrency_limit(concurrency_limit);
 
         let mut scheduler = Scheduler::new(queue, job);
         scheduler.set_shutdown_token(shutdown_token.clone());
