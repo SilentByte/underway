@@ -140,6 +140,10 @@ use crate::{
     queue::{Error as QueueError, InProgressTask, Queue, SHUTDOWN_CHANNEL},
     task::{Error as TaskError, RetryCount, RetryPolicy, Task, TaskId},
 };
+
+// Channel notified by the `task_change` trigger (see migrations).
+const TASK_CHANGE_CHANNEL: &str = "task_change";
+
 pub(crate) type Result<T = ()> = std::result::Result<T, Error>;
 
 /// Worker errors.
@@ -536,13 +540,12 @@ impl<T: Task + Sync> Worker<T> {
     pub async fn run_every(&self, period: Span) -> Result {
         let mut polling_interval = tokio::time::interval(period.try_into()?);
 
-        // Set up a listener for shutdown notifications
-        let mut shutdown_listener = PgListener::connect_with(&self.queue.pool).await?;
-        shutdown_listener.listen(SHUTDOWN_CHANNEL).await?;
-
-        // Set up a listener for task change notifications
-        let mut task_change_listener = PgListener::connect_with(&self.queue.pool).await?;
-        task_change_listener.listen("task_change").await?;
+        // Set up a single listener for both shutdown and task change notifications
+        // so that the worker only holds one database connection while idle.
+        let mut listener = PgListener::connect_with(&self.queue.pool).await?;
+        listener
+            .listen_all([SHUTDOWN_CHANNEL, TASK_CHANGE_CHANNEL])
+            .await?;
 
         let concurrency_limit = Arc::new(Semaphore::new(self.concurrency_limit));
         let mut processing_tasks = JoinSet::new();
@@ -558,35 +561,25 @@ impl<T: Task + Sync> Worker<T> {
                     reap_completed(&mut processing_tasks);
                 }
 
-                notify_shutdown = shutdown_listener.recv() => {
-                    match notify_shutdown {
-                        Ok(_) => {
-                            self.shutdown_token.cancel();
-                        },
-
-                        Err(err) => {
-                            tracing::error!(%err, "Postgres shutdown notification error");
-                            self.backoff_sleep().await;
-                        }
-                    }
-                }
-
                 _ = self.shutdown_token.cancelled() => {
                     self.handle_shutdown(&mut processing_tasks).await?;
                     break
                 }
 
-                // Listen for new pending tasks.
-                notify_task_change = task_change_listener.recv() => {
-                    match notify_task_change {
+                // Listen for shutdown and new pending tasks.
+                notification = listener.recv() => {
+                    match notification {
+                        Ok(notification) if notification.channel() == SHUTDOWN_CHANNEL => {
+                            self.shutdown_token.cancel();
+                        }
+
                         Ok(task_change) => self.handle_task_change(task_change, concurrency_limit.clone(), &mut processing_tasks).await?,
 
                         Err(err) => {
-                            tracing::error!(%err, "Postgres task change notification error");
+                            tracing::error!(%err, "Postgres notification error");
                             self.backoff_sleep().await;
                         }
-                    };
-
+                    }
                 }
 
                 // Pending task polling fallback.

@@ -2,13 +2,13 @@ use std::{result::Result as StdResult, str::FromStr, sync::Arc, time::Duration a
 
 use jiff::{tz::TimeZone, Zoned};
 use jiff_cron::{Schedule, ScheduleIterator};
-use sqlx::postgres::{PgAdvisoryLock, PgListener};
+use sqlx::postgres::PgAdvisoryLock;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 use crate::{
-    queue::{try_acquire_advisory_lock, Error as QueueError, SHUTDOWN_CHANNEL},
+    queue::{try_acquire_advisory_lock, Error as QueueError},
     Queue, Task,
 };
 
@@ -55,10 +55,6 @@ pub struct Scheduler<T: Task> {
 }
 
 impl<T: Task> Scheduler<T> {
-    async fn backoff_sleep(&self) {
-        tokio::time::sleep(self.backoff_delay).await;
-    }
-
     /// Sets the backoff delay.
     pub fn set_backoff_delay(&mut self, delay: StdDuration) {
         self.backoff_delay = delay;
@@ -223,7 +219,6 @@ impl<T: Task> Scheduler<T> {
     /// This function returns an error if:
     ///
     /// - It cannot acquire a new connection from the queue's pool.
-    /// - It fails to listen on either the shutdown channel.
     /// - The cron expression or timezone IANA name are malformed.
     ///
     /// # Example
@@ -311,9 +306,10 @@ impl<T: Task> Scheduler<T> {
             return Ok(());
         };
 
-        // Set up a listener for shutdown notifications
-        let mut shutdown_listener = PgListener::connect_with(&self.queue.pool).await?;
-        shutdown_listener.listen(SHUTDOWN_CHANNEL).await?;
+        // N.B.: Unlike upstream, the scheduler does not listen for shutdown
+        // notifications itself to save a database connection. It relies on its
+        // shutdown token instead, which is shared with and cancelled by the
+        // worker's shutdown listener when started via `Job::start_with_backoff`.
 
         // TODO: Handle updates to schedules?
 
@@ -321,18 +317,6 @@ impl<T: Task> Scheduler<T> {
             tracing::debug!(?next, "Waiting until next scheduled task enqueue");
 
             tokio::select! {
-                notify_shutdown = shutdown_listener.recv() => {
-                    match notify_shutdown {
-                        Ok(_) => {
-                            self.shutdown_token.cancel();
-                        },
-                        Err(err) => {
-                            tracing::error!(%err, "Postgres shutdown notification error");
-                            self.backoff_sleep().await;
-                        }
-                    }
-                }
-
                 _ = self.shutdown_token.cancelled() => {
                     break
                 }
